@@ -3,13 +3,15 @@ require 'http'
 require 'json'
 require 'sinatra/base'
 require 'sinatra/config_file'
+require 'sinatra/multi_route'
 
 class TrainingPeaksCalendar < Sinatra::Base
   register Sinatra::ConfigFile
+  register Sinatra::MultiRoute
 
   config_file 'config.yml'
 
-  get "/" do
+  get "/", "/training-peaks.ics" do
     get_calendar(get_calendar_items)
   end
 
