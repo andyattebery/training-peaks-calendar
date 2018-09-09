@@ -12,6 +12,8 @@ class TrainingPeaksCalendar < Sinatra::Base
   config_file 'config.yml'
 
   get "/", "/training-peaks.ics" do
+    content_type "text/calendar"
+    attachment "training-peaks.ics"
     get_calendar(get_calendar_items)
   end
 
