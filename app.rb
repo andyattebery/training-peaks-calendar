@@ -15,17 +15,17 @@ class TrainingPeaksCalendar < Sinatra::Base
     content_type "text/calendar"
     attachment "training-peaks.ics"
 
-    auth_cookie = get_auth_cookie
+    auth_cookie = get_auth_cookie(settings.training_peaks[:username], settings.training_peaks[:password])
     user_id = get_user_id(auth_cookie)
     get_calendar(get_calendar_items(auth_cookie, user_id))
   end
 
-  def get_auth_cookie
+  def get_auth_cookie(username, password)
     response = 
       HTTP.post("https://home.trainingpeaks.com/login",
         :form => {
-          :username => settings.training_peaks[:username],
-          :password => settings.training_peaks[:password]
+          :username => username,
+          :password => password
         })
     response.cookies.each do |c|
       if c.name == "Production_tpAuth"
