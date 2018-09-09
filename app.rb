@@ -18,8 +18,10 @@ class TrainingPeaksCalendar < Sinatra::Base
   end
 
   def get_calendar_items
+    auth_cookie = get_auth_cookie
+
     response = 
-      HTTP.cookies(:Production_tpAuth => settings.training_peaks[:cookie])
+      HTTP.cookies(:Production_tpAuth => auth_cookie)
           .get("https://tpapi.trainingpeaks.com/fitness/v1/athletes/#{settings.training_peaks[:athlete_id]}/workouts/2018-07-23/2019-02-24")
 
     JSON.parse(response.to_s)
@@ -42,6 +44,20 @@ class TrainingPeaksCalendar < Sinatra::Base
     cal.publish
 
     cal.to_ical
+  end
+
+  def get_auth_cookie
+    response = 
+      HTTP.post("https://home.trainingpeaks.com/login",
+        :form => {
+          :username => settings.training_peaks[:username],
+          :password => settings.training_peaks[:password]
+        })
+    response.cookies.each do |c|
+      if c.name == "Production_tpAuth"
+        return c.value
+      end
+    end
   end
 
   def get_title item
