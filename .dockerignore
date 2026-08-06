@@ -1,0 +1,19 @@
+# Credentials. config.yml holds a TrainingPeaks username and password, and
+# optionally a Production_tpAuth session cookie that cannot be revoked on
+# demand. It is bind-mounted at run time; it must never enter an image layer,
+# because anything baked into a layer stays there.
+config.yml
+
+# Personal training data captured for offline tests.
+scratch/
+
+.git/
+.gitignore
+.dockerignore
+.ruby-version
+
+docs/
+README.md
+
+.bundle/
+vendor/bundle/

@@ -1,5 +1,9 @@
 config.yml
 
+# Real API response dumps used as offline test fixtures. These contain
+# personal training data and must never be committed.
+/scratch/
+
 *.gem
 *.rbc
 /.config
