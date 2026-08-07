@@ -15,5 +15,10 @@ scratch/
 docs/
 README.md
 
+# Not needed at runtime. The fixture is sanitised, so this is weight, not risk.
+test/
+Rakefile
+.github/
+
 .bundle/
 vendor/bundle/
