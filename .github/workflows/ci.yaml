@@ -1,0 +1,157 @@
+---
+name: ci
+
+on:
+  push:
+    branches: [master]
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+*'
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/andyattebery/training-peaks-calendar
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: .ruby-version
+          bundler-cache: true
+      - run: bundle exec rake
+
+  # There is deliberately no e2e job. Every end-to-end path needs real
+  # TrainingPeaks credentials, and CI has none — nor should it. The suite above
+  # runs with WebMock.disable_net_connect!, so it never reaches the network.
+
+  version:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is_release: ${{ steps.version.outputs.is_release }}
+    steps:
+      - id: version
+        run: |
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          TAG: ${{ github.ref_name }}
+
+  # One job per architecture on a native runner. This image builds four native
+  # gems (puma, llhttp-ffi, unf_ext, ffi); under QEMU the arm64 leg would spend
+  # nearly all its time compiling. Hence no setup-qemu-action anywhere — if you
+  # find yourself adding one, the split has stopped doing its job.
+  build:
+    needs: [test, version]
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push by digest only; the merge job attaches the human-readable tags.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          # Scoped per architecture so the two legs do not evict each other.
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+          if-no-files-found: error
+
+  merge:
+    needs: [version, build]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create the multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE}:${VERSION}" \
+            $(printf "${IMAGE}@sha256:%s " *)
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+
+      # Prereleases (tags containing a hyphen) get a version tag but must not
+      # move :latest.
+      - name: Promote :latest
+        if: needs.version.outputs.is_release == 'true'
+        run: |
+          docker buildx imagetools create -t "${IMAGE}:latest" "${IMAGE}:${VERSION}"
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+
+      - name: Verify both architectures are present
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest}}' \
+            | tee /tmp/manifest.json
+          for want in linux/amd64 linux/arm64; do
+            grep -q "\"platform\":{\"architecture\":\"${want#linux/}\",\"os\":\"linux\"" /tmp/manifest.json \
+              || { echo "::error::${want} missing from the published manifest"; exit 1; }
+          done
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
