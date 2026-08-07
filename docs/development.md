@@ -4,6 +4,24 @@ TrainingPeaks has no public API for this. Everything here was worked out by obse
 client, and none of it is documented or guaranteed. This file records what is known so it does not have to be
 rediscovered — the last rediscovery took a whole session.
 
+## Layout
+
+| file | holds |
+|---|---|
+| `app.rb` | the web layer only — two routes, the 502 handler, config wiring |
+| `lib/training_peaks.rb` | module namespace and the two error classes |
+| `lib/training_peaks/client.rb` | stateless HTTP. Every method makes exactly the request it names |
+| `lib/training_peaks/session.rb` | stateful policy: what to cache, how long, and when to retry |
+| `lib/training_peaks/workout.rb` | the model, and the only place that knows TrainingPeaks' field names |
+| `lib/workout_calendar.rb` | presentation: emoji, title and description formatting, ICS |
+
+The split that matters is **client versus session**: the client knows *how* to make a request, the session
+decides *whether* to. The lockout-protection rule lives in the session for that reason.
+
+The other one is **model versus calendar**: `Workout` is what TrainingPeaks said, `WorkoutCalendar` is how we
+show it. Emoji belong strictly in the latter — an earlier version encoded `YOGA = 5` as though the API meant
+yoga by it, which it does not (5 is Crosstrain).
+
 ## The authentication chain
 
 Three steps, three hosts. Getting workout data requires all of them, in order.
@@ -87,8 +105,8 @@ request*, which is actively harmful given the lockout counter.
 | access token | 3600 seconds | refreshed 60s early |
 | `Production_tpAuth` | long lived; survives logout | re-obtained only when a token exchange is refused |
 
-`AuthCache` in [`app.rb`](../app.rb) implements this and is mutex-guarded, since puma serves on several
-threads. `config/puma.rb` deliberately runs `workers 0` — the cache is in process memory, so each extra
+`TrainingPeaks::Session` in [`lib/training_peaks/session.rb`](../lib/training_peaks/session.rb) implements
+this and is mutex-guarded, since puma serves on several threads. `config/puma.rb` deliberately runs `workers 0` — the cache is in process memory, so each extra
 worker would maintain its own cookie and token, meaning one login per worker rather than one login overall.
 
 ## Hazards
@@ -96,7 +114,7 @@ worker would maintain its own cookie and token, meaning one login per worker rat
 Rules, not trivia. Each of these was learned the hard way.
 
 - **Never auto-retry a failed login.** Every failure increments TrainingPeaks' `Attempts` counter and moves
-  the account toward lockout. `AuthCache#exchange` retries only for a *session cookie it obtained itself and
+  the account toward lockout. `Session#exchange` retries only for a *session cookie it obtained itself and
   can replace*, never for a rejected credential.
 - **Do not probe endpoints unauthenticated to discover routes.** Sweeping URLs to see what returns 404 versus
   401 is exactly the traffic that gets an IP flagged. The version table above is already the answer; if you
@@ -111,39 +129,90 @@ Rules, not trivia. Each of these was learned the hard way.
 
 ## The workout payload
 
-Seven fields drive the calendar. All were confirmed present on live v7 responses:
+Nine fields drive the calendar. `TrainingPeaks::Workout.from_api` is the **only** place that knows these
+names — everything downstream reads the model's accessors, so a renamed API field costs one method:
 
-| field | notes |
-|---|---|
-| `workoutDay` | `"2026-08-06T00:00:00"`; `Date.parse` handles it |
-| `title` | |
-| `workoutTypeValueId` | see below |
-| `totalTimePlanned` | **fractional hours**, not minutes — `0.5` is 30 minutes. Often nil |
-| `tssPlanned` | float, frequently nil |
-| `description` | plain text, not HTML; multi-line; unicode throughout |
-| `startTime` | nil on planned work |
+| API field | model accessor | notes |
+|---|---|---|
+| `workoutDay` | `date` | `"2026-08-06T00:00:00"`; `Date.parse` handles it |
+| `title` | `title` | |
+| `workoutTypeValueId` | `sport_id` | see below |
+| `workoutSubTypeId` | `subtype_id` | usually nil; a **separate namespace** from `sport_id` |
+| `totalTimePlanned` | `planned_duration` | **fractional hours**, not minutes — `0.5` is 30 minutes. Often nil |
+| `tssPlanned` | `planned_tss` | float, frequently nil |
+| `description` | `description` | plain text, not HTML; multi-line; unicode throughout |
+| `completed` | `completed` | nil on planned work |
+| `startTime` | `started_at` | nil on planned work; carried only because `completed?` reads it |
 
-`totalTimePlanned` and `tssPlanned` are nil often enough that the guards in `get_description` are load-bearing,
-not defensive padding.
+`planned_duration` and `planned_tss` are nil often enough that the guards in
+`WorkoutCalendar#description_for` are load-bearing, not defensive padding.
+
+`Workout#formatted_duration` renders `"HH:MM"` and **counts past 24 hours**. An earlier version formatted a
+`Time`, which wrapped: 25.5 hours came out as `01:30`. It truncates rather than rounds, matching that older
+behaviour so existing feeds do not shift by a minute.
 
 ### Workout type ids
 
-**Observed, not documented, and certainly incomplete.** Unknown ids fall through to the plain title, which is
-the correct behaviour — do not turn an unrecognised id into an error.
+**Authoritative.** `GET /fitness/v6/workouttypes` (bearer token) returns the whole list. Retrieved
+2026-08-06; regenerate it rather than trusting this table:
 
-| id | meaning |
-|---|---|
-| 2 | Bike |
-| 5 | Yoga |
-| 7 | Rest |
-| 10 | Mental training (the `MTP - …` entries) |
+```ruby
+JSON.parse(HTTP.auth("Bearer #{token}")
+  .get("https://tpapi.trainingpeaks.com/fitness/v6/workouttypes").to_s)
+```
 
-Type 5 has never appeared in a live response for this account; the yoga branch is carried on the strength of
-the original author having written it, not on evidence.
+| id | name | subtypes |
+|---|---|---|
+| 1 | Swim | 1 Open Water, 2 Pool |
+| 2 | Bike | 3 Road, 4 Gravel, 5 Track, 6 Indoor, 7 Cyclocross, 8 E-Bike, 9 Hand Cycling, 47 Time Trial, 49 Virtual |
+| 3 | Run | 10 Road, 11 Track, 12 Trail, 13 Indoor, 50 Virtual |
+| 4 | Brick | — |
+| 5 | Crosstrain | — |
+| 6 | Race | — |
+| 7 | Day Off | — |
+| 8 | Mountain Bike | 14 XC, 15 Enduro, 16 Downhill, 17 Short Track, 18 Fat Bike, 19 E-MTB |
+| 9 | Strength | — |
+| 10 | Custom | — |
+| 11 | XC-Ski | 26 Classic, 27 Skate, 28 Alpine, 29 Touring, 30 Mountaineering, 31 Biathlon, 32 Roller, 33 Nordic Combined, 34 Split Board, 46 Cross Country |
+| 12 | Rowing | 39 Indoor, 51 Virtual |
+| 13 | Walk | 41 Hike, 42 Treadmill, 43 Mountaineering, 44 Hunting |
+| 29 | Strength *(newer family)* | 20 Mobility, 21 Functional Fitness, 22 Yoga, 23 Rock Climbing, 24 Hybrid Strength, 25 Stretching |
+| 100 | Other | 35 Canoe, 36 SUP, 37 Sailing, 38 Kayak, 40 Surfing, 45 Speed Skating, 48 Equestrian |
+
+Unknown ids must still fall through to the plain title — the list can grow, and an unrecognised id is not an
+error.
+
+#### Two traps in the id spaces
+
+**`workoutTypeValueId` and `workoutSubTypeId` are separate namespaces, and they overlap.** Values 1–13 and 29
+appear in both, meaning different things: subtype `2` is "Pool Swim" while type `2` is "Bike". Never look up
+one in the other's map. `WorkoutCalendar` keeps `SPORT_EMOJI` and `SUBTYPE_EMOJI` separate for exactly this
+reason, and `TrainingPeaks::Workout` names them `sport_id` and `subtype_id` so the two cannot be confused at
+a call site.
+
+**Subtype ids are globally unique** — 51 subtypes numbered 1–51, with no value reused across parent types.
+That is what makes a single flat `SUBTYPE_EMOJI` map correct instead of needing `(type, subtype)` pairs. If
+TrainingPeaks ever adds a colliding subtype, that assumption breaks.
+
+#### There is no Yoga type
+
+Yoga is subtype **22 under type 29 (Strength)**. It has never been a top-level type. Note also that *two*
+Strength types exist — 9 and 29 — and only 29 carries subtypes.
+
+#### Personal naming conventions, which are not API semantics
+
+`WorkoutCalendar#personal_override` matches on **titles**, not ids, and applies only to this athlete's data:
+
+- Sufferfest files yoga under **Crosstrain (5)** with a `Yoga:` title prefix. Type 5 does not mean yoga.
+- Sufferfest files its mental-training modules under **Custom (10)** titled `MTP - …`. Type 10 does not mean
+  mental training.
+
+Both were previously encoded as `YOGA = 5` and `MENTAL_TRAINING = 10`, which asserted things about the API
+that are false. Keep title-based rules in `personal_override` so the id maps stay honest.
 
 ### Completion
 
-`get_title` marks a workout done if **either** `completed == true` **or** `startTime` is non-nil.
+`TrainingPeaks::Workout#completed?` marks a workout done if **either** `completed == true` **or** `startTime` is non-nil.
 
 Both are checked because there is no evidence for which one TrainingPeaks populates: the account has no
 workout history at all, so every sampled workout has both fields nil. If real completed workouts ever appear,
@@ -158,27 +227,56 @@ session.
 Ruby's `%` returns non-negative results, which is what makes the Sunday edge case work — `(0 - 1) % 7 == 6`,
 so a Sunday walks back six days to Monday rather than forward one.
 
-## Testing offline
+## Tests
 
-The calendar logic needs no network and no credentials. Save a real v7 response and render it directly:
+```sh
+bundle exec rake
+```
+
+The whole suite runs with `WebMock.disable_net_connect!`, so it needs no network and no credentials — an
+unstubbed request fails the test rather than quietly reaching TrainingPeaks. That is structural, not a
+convention to remember.
+
+`test/fixtures/workouts.json` is a **sanitised** copy of a real v7 response: identical keys, identical nil
+pattern (1 of 15 has no `totalTimePlanned`, 8 have no `tssPlanned`), identical type distribution, but
+invented titles and descriptions. Regenerate it from a real dump rather than editing it by hand — a
+hand-written fixture drifts from the nil pattern, which is the part that actually catches bugs.
+
+### What the tests are protecting
+
+Most of them are ordinary, but three encode rules that are easy to "simplify" into breakage:
+
+- **`test_rejected_hand_supplied_cookie_never_attempts_a_login`** — asserts *zero* requests to the login URL.
+  A pasted `auth_cookie` cannot be refreshed by logging in, so retrying would burn attempts against the
+  `Attempts` lockout counter for nothing.
+- **`test_expired_token_is_re_exchanged_without_logging_in_again`** — an expired token needs a new token, not
+  a new session. Getting this wrong means one login per hour, forever.
+- **`test_subtype_ids_are_not_looked_up_as_sport_ids`** — the two id namespaces overlap; see the traps above.
+
+These assert on **request counts**, not return values, because the damage they prevent is invisible from a
+return value.
+
+### Working against real data
+
+Point the same code at a real dump when you need to:
 
 ```ruby
 require './app'
-app   = TrainingPeaksCalendar.new!          # new! gets the raw instance, not the Rack wrapper
-items = JSON.parse(File.read('scratch/workouts.json'))
-puts app.get_calendar(items)
+
+workouts = JSON.parse(File.read('scratch/workouts.json'))
+                .map { |hash| TrainingPeaks::Workout.from_api(hash) }
+puts WorkoutCalendar.new(workouts).to_ics
 ```
 
-Useful checks:
+Or drive the real thing end to end, which needs credentials in `config.yml`:
 
 ```ruby
-app.get_title(items.first)                                   # emoji branch
-app.completed?(items.first.merge('completed' => true))       # done marker
-TrainingPeaksCalendar.calendar_window(Date.new(2026, 8, 6))  # => 2026-04-13 .. 2027-01-24
+session = TrainingPeaks::Session.new(TrainingPeaksCalendar.settings.training_peaks)
+puts WorkoutCalendar.new(session.workouts).to_ics
 ```
 
 `scratch/` is gitignored: those dumps are real training data. Capture one from DevTools by copying the
 response of the `fitness/v7/.../workouts/...` request.
 
-Round-tripping through `Icalendar::Calendar.parse` is worth doing after any change to the rendering — it
-catches emoji and line-folding damage that eyeballing the output will not.
+Round-tripping through `Icalendar::Calendar.parse` is worth doing after any change to rendering — it catches
+emoji and line-folding damage that eyeballing the output will not.
